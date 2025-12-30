@@ -1,0 +1,832 @@
+Yes — you can do this as a **single-file Python “low-code” web app** that runs on your Raspberry Pi, shows a **full-screen scoreboard on the monitor**, and gives you a **control screen on your phone**.
+
+Below is a complete working starter that includes **4 basic games**:
+
+* **501** (simple rules: subtract score, bust resets turn)
+* **Cricket** (15–20 + Bull, marks + points when closed and opponent not)
+* **Around the Clock**
+* **Leaderboard** (party points)
+
+---
+
+## How we’re doing it (simple + party-proof)
+
+1. **Python + Flask** runs a tiny web server on the Pi.
+2. The Pi monitor opens **`/display`** (big scoreboard).
+3. Your phone opens **`/control`** (buttons + score entry).
+4. The display updates automatically (polling every ~0.7s — no complicated websockets).
+
+---
+
+## Step-by-step setup on the Raspberry Pi
+
+### 1) Install Flask
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-pip
+pip3 install flask
+```
+
+### 2) Create `darts_party.py`
+
+Copy/paste this entire file:
+
+```python
+from flask import Flask, request, jsonify, render_template_string
+import time
+
+app = Flask(__name__)
+
+# ---------------------------
+# In-memory game state (simple for party use)
+# ---------------------------
+STATE = {
+    "game": None,            # "501" | "cricket" | "atc" | "leaderboard"
+    "players": [],
+    "current": 0,
+    "started": False,
+    "created_at": time.time(),
+    "settings": {
+        "501_start": 501,
+        "501_double_out": False,
+    },
+    # Per-game data
+    "data": {}
+}
+
+CRICKET_NUMS = [20, 19, 18, 17, 16, 15, "BULL"]
+
+def reset_state():
+    STATE["game"] = None
+    STATE["players"] = []
+    STATE["current"] = 0
+    STATE["started"] = False
+    STATE["data"] = {}
+    STATE["settings"] = {"501_start": 501, "501_double_out": False}
+    STATE["created_at"] = time.time()
+
+def ensure_players():
+    if not STATE["players"]:
+        STATE["players"] = ["Player 1", "Player 2"]
+
+def current_player():
+    ensure_players()
+    return STATE["players"][STATE["current"] % len(STATE["players"])]
+
+def advance_turn():
+    if STATE["players"]:
+        STATE["current"] = (STATE["current"] + 1) % len(STATE["players"])
+
+def init_game(game):
+    ensure_players()
+    STATE["game"] = game
+    STATE["started"] = True
+    STATE["current"] = 0
+
+    if game == "501":
+        start = int(STATE["settings"].get("501_start", 501))
+        STATE["data"] = {
+            "scores": {p: start for p in STATE["players"]},
+            "last_turn": {p: None for p in STATE["players"]},
+            "winner": None
+        }
+
+    elif game == "cricket":
+        # marks: 0..3+ (we allow >3 but treat as "extra hits" for points)
+        STATE["data"] = {
+            "marks": {p: {str(n): 0 for n in CRICKET_NUMS} for p in STATE["players"]},
+            "points": {p: 0 for p in STATE["players"]},
+            "winner": None
+        }
+
+    elif game == "atc":
+        # Around the Clock: hit 1..20 then bull to win
+        STATE["data"] = {
+            "target": {p: 1 for p in STATE["players"]},
+            "winner": None
+        }
+
+    elif game == "leaderboard":
+        STATE["data"] = {
+            "points": {p: 0 for p in STATE["players"]},
+            "winner": None
+        }
+
+def safe_int(val, default=0):
+    try:
+        return int(val)
+    except:
+        return default
+
+# ---------------------------
+# Game logic
+# ---------------------------
+def handle_501_add(score):
+    if STATE["data"].get("winner"):
+        return
+
+    p = current_player()
+    score = max(0, min(180, int(score)))
+    start_score = STATE["data"]["scores"][p]
+    new_score = start_score - score
+
+    # Bust rules (simple):
+    # - If new_score < 0 => bust (score doesn't change)
+    # - If double_out enabled: must finish on exactly 0 with even last dart (not tracked here)
+    #   We'll implement simplified: if double_out enabled, require final throw score to be even and not 1.
+    # - If new_score == 1 => bust (common 501 rule with double-out; we apply always to reduce confusion)
+    bust = False
+
+    if new_score < 0 or new_score == 1:
+        bust = True
+
+    if new_score == 0 and STATE["settings"].get("501_double_out", False):
+        # simplified double-out requirement:
+        # final throw score must be even and <= 40 or bull(50) ideally; we can't track darts,
+        # so we just require the entered score to be even OR 50.
+        if not (score == 50 or score % 2 == 0):
+            bust = True
+
+    if bust:
+        STATE["data"]["last_turn"][p] = f"BUST (tried {score})"
+    else:
+        STATE["data"]["scores"][p] = new_score
+        STATE["data"]["last_turn"][p] = f"-{score} → {new_score}"
+        if new_score == 0:
+            STATE["data"]["winner"] = p
+
+    advance_turn()
+
+def handle_cricket_hit(number, hits):
+    """
+    number: one of 20..15, BULL
+    hits: 1..3 typically
+    marks beyond 3 become extra "scoring hits" if opponent not closed
+    """
+    if STATE["data"].get("winner"):
+        return
+
+    p = current_player()
+    num_key = str(number).upper()
+    hits = max(0, min(3, int(hits)))
+
+    if num_key not in STATE["data"]["marks"][p]:
+        return
+
+    # Apply hits
+    for _ in range(hits):
+        before = STATE["data"]["marks"][p][num_key]
+        if before < 3:
+            STATE["data"]["marks"][p][num_key] += 1
+        else:
+            # extra hit => score points if at least one opponent not closed
+            # points value: bull=25 per mark; 15-20 use face value
+            not_closed_exists = False
+            for opp in STATE["players"]:
+                if opp == p:
+                    continue
+                if STATE["data"]["marks"][opp][num_key] < 3:
+                    not_closed_exists = True
+                    break
+            if not_closed_exists:
+                val = 25 if num_key == "BULL" else int(num_key)
+                STATE["data"]["points"][p] += val
+
+    # Winner check (common: must have all closed AND >= points of others)
+    all_closed = all(STATE["data"]["marks"][p][str(n)] >= 3 for n in CRICKET_NUMS)
+    if all_closed:
+        max_other = max(STATE["data"]["points"][o] for o in STATE["players"] if o != p) if len(STATE["players"]) > 1 else 0
+        if STATE["data"]["points"][p] >= max_other:
+            STATE["data"]["winner"] = p
+
+    advance_turn()
+
+def handle_atc_hit(success):
+    if STATE["data"].get("winner"):
+        return
+    p = current_player()
+    if success:
+        t = STATE["data"]["target"][p]
+        # after 20, next target becomes 25 bull
+        if t <= 20:
+            STATE["data"]["target"][p] = t + 1
+        else:
+            # t==21 indicates bull completed
+            STATE["data"]["winner"] = p
+    advance_turn()
+
+def handle_leaderboard_add(points):
+    if STATE["data"].get("winner"):
+        # leaderboard doesn't really "win" unless you want; we just keep adding
+        pass
+    p = current_player()
+    points = safe_int(points, 0)
+    STATE["data"]["points"][p] += points
+    advance_turn()
+
+# ---------------------------
+# Views
+# ---------------------------
+DISPLAY_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Darts Party Display</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background: #0b0f14; color: #e8eef7; }
+    .top { padding: 18px 22px; display:flex; align-items:center; justify-content:space-between; border-bottom: 1px solid #1d2a3a;}
+    .game { font-size: 22px; font-weight: 700; letter-spacing: 0.4px;}
+    .meta { opacity: 0.85; font-size: 14px;}
+    .wrap { padding: 18px 22px; }
+    .card { background:#0f1722; border:1px solid #1d2a3a; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+    .grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .pname { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
+    .big { font-size: 44px; font-weight: 800; }
+    .small { opacity: 0.85; }
+    .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; border:1px solid #2a3c52; background:#101c2b; font-size: 13px; opacity: 0.95;}
+    .active { border-color: #6aa3ff; box-shadow: 0 0 0 2px rgba(106,163,255,0.15) inset; }
+    .winner { border-color:#7CFFB0; box-shadow: 0 0 0 2px rgba(124,255,176,0.12) inset;}
+    table { width:100%; border-collapse: collapse; }
+    td, th { padding: 6px 8px; border-bottom: 1px solid #1d2a3a; text-align:left; }
+    .muted { opacity:0.7; }
+    .footer { padding: 10px 22px; opacity:0.7; font-size: 12px; border-top: 1px solid #1d2a3a;}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div>
+      <div class="game" id="gameTitle">Darts Party</div>
+      <div class="meta" id="metaLine">Loading…</div>
+    </div>
+    <div class="pill" id="turnPill">Turn: —</div>
+  </div>
+
+  <div class="wrap" id="content"></div>
+
+  <div class="footer">
+    Open <span class="muted">/control</span> on your phone to run the game.
+  </div>
+
+<script>
+async function refresh() {
+  const r = await fetch('/state');
+  const s = await r.json();
+
+  document.getElementById('gameTitle').textContent = s.game ? ("Game: " + s.game.toUpperCase()) : "Darts Party";
+  document.getElementById('metaLine').textContent =
+    s.started ? ("Players: " + s.players.join(", ")) : "Go to /control to set players and start a game.";
+
+  const current = s.players.length ? s.players[s.current] : "—";
+  document.getElementById('turnPill').textContent = "Turn: " + current;
+
+  const c = document.getElementById('content');
+  c.innerHTML = "";
+
+  if (!s.started) {
+    c.innerHTML = `<div class="card"><div class="pname">Not started</div><div class="small">Open /control to choose a game and add players.</div></div>`;
+    return;
+  }
+
+  if (s.game === "501") {
+    const winner = s.data.winner;
+    const grid = document.createElement('div');
+    grid.className = "grid";
+    for (const p of s.players) {
+      const card = document.createElement('div');
+      let cls = "card";
+      if (p === current) cls += " active";
+      if (winner && p === winner) cls += " winner";
+      card.className = cls;
+
+      const last = s.data.last_turn[p] || "";
+      card.innerHTML = `
+        <div class="pname">${p}</div>
+        <div class="big">${s.data.scores[p]}</div>
+        <div class="small">${last}</div>
+      `;
+      grid.appendChild(card);
+    }
+    c.appendChild(grid);
+    if (winner) {
+      c.insertAdjacentHTML('afterbegin', `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>`);
+    }
+    return;
+  }
+
+  if (s.game === "leaderboard") {
+    const points = s.data.points;
+    const rows = Object.entries(points).sort((a,b)=>b[1]-a[1]).map(([p,pt],i)=>(
+      `<tr><td>${i+1}</td><td>${p}</td><td><b>${pt}</b></td></tr>`
+    )).join("");
+    c.innerHTML = `
+      <div class="card">
+        <div class="pname">Leaderboard</div>
+        <table>
+          <thead><tr><th>#</th><th>Player</th><th>Points</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>`;
+    return;
+  }
+
+  if (s.game === "atc") {
+    const grid = document.createElement('div');
+    grid.className = "grid";
+    const winner = s.data.winner;
+    for (const p of s.players) {
+      const t = s.data.target[p];
+      const targetText = (t <= 20) ? `Hit ${t}` : (t === 21 ? "Done ✅" : "Bull");
+      const card = document.createElement('div');
+      let cls = "card";
+      if (p === current) cls += " active";
+      if (winner && p === winner) cls += " winner";
+      card.className = cls;
+      card.innerHTML = `
+        <div class="pname">${p}</div>
+        <div class="big">${targetText}</div>
+        <div class="small">Progress: ${Math.min(t-1,20)}/20</div>
+      `;
+      grid.appendChild(card);
+    }
+    c.appendChild(grid);
+    if (winner) {
+      c.insertAdjacentHTML('afterbegin', `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>`);
+    }
+    return;
+  }
+
+  if (s.game === "cricket") {
+    const winner = s.data.winner;
+    const marks = s.data.marks;
+    const pts = s.data.points;
+
+    // summary cards
+    const grid = document.createElement('div');
+    grid.className = "grid";
+    for (const p of s.players) {
+      const card = document.createElement('div');
+      let cls = "card";
+      if (p === current) cls += " active";
+      if (winner && p === winner) cls += " winner";
+      card.className = cls;
+
+      const closedCount = Object.values(marks[p]).filter(v => v >= 3).length;
+      card.innerHTML = `
+        <div class="pname">${p}</div>
+        <div class="big">${pts[p]}</div>
+        <div class="small">Closed: ${closedCount}/7</div>
+      `;
+      grid.appendChild(card);
+    }
+    c.appendChild(grid);
+
+    // marks table
+    let header = CRICKET_NUMS.map(n => `<th>${n}</th>`).join("");
+    let body = s.players.map(p => {
+      const cols = CRICKET_NUMS.map(n => {
+        const v = marks[p][String(n)];
+        const disp = v >= 3 ? "✔✔✔" : ("•".repeat(v) + "—".repeat(3-v));
+        return `<td>${disp}</td>`;
+      }).join("");
+      return `<tr><td><b>${p}</b></td>${cols}<td><b>${pts[p]}</b></td></tr>`;
+    }).join("");
+
+    c.insertAdjacentHTML('beforeend', `
+      <div class="card">
+        <div class="pname">Cricket Marks</div>
+        <table>
+          <thead><tr><th>Player</th>${header}<th>Pts</th></tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+        <div class="small muted">Tip: Extra hits after closing score points only if an opponent is not closed.</div>
+      </div>
+    `);
+
+    if (winner) {
+      c.insertAdjacentHTML('afterbegin', `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>`);
+    }
+    return;
+  }
+}
+
+setInterval(refresh, 700);
+refresh();
+</script>
+</body>
+</html>
+"""
+
+CONTROL_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Darts Party Control</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background: #0b0f14; color: #e8eef7; }
+    .wrap { padding: 16px; max-width: 820px; margin: 0 auto;}
+    .card { background:#0f1722; border:1px solid #1d2a3a; border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+    input, select, button { font-size: 16px; padding: 10px; border-radius: 12px; border: 1px solid #2a3c52; background:#0b1220; color:#e8eef7; }
+    button { cursor: pointer; }
+    .row { display:flex; gap:10px; flex-wrap:wrap; }
+    .row > * { flex: 1 1 auto; }
+    .title { font-size: 18px; font-weight: 800; margin-bottom: 10px; }
+    .muted { opacity:0.75; font-size: 13px; }
+    .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; border:1px solid #2a3c52; background:#101c2b; font-size: 13px; }
+    .danger { border-color: #ff6a6a; }
+    .ok { border-color: #7CFFB0; }
+    .btnrow button { flex: 1 1 120px; }
+    .spacer { height: 6px; }
+    a { color:#9ec5ff; text-decoration:none; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <div class="title">Quick Links</div>
+    <div class="muted">Display screen: <a href="/display" target="_blank">/display</a></div>
+    <div class="muted">This page is the scorekeeper control panel.</div>
+  </div>
+
+  <div class="card">
+    <div class="title">1) Players</div>
+    <div class="row">
+      <input id="players" placeholder="Comma-separated: Alex, Sheila, ..." />
+      <button onclick="setPlayers()">Set Players</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="row">
+      <button class="danger" onclick="resetAll()">Reset Everything</button>
+      <button onclick="nextTurn()">Next Turn</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="pill" id="turnPill">Turn: —</div>
+  </div>
+
+  <div class="card">
+    <div class="title">2) Start a Game</div>
+    <div class="row">
+      <select id="gameSel">
+        <option value="501">501</option>
+        <option value="cricket">Cricket</option>
+        <option value="atc">Around the Clock</option>
+        <option value="leaderboard">Leaderboard</option>
+      </select>
+      <button class="ok" onclick="startGame()">Start / Restart</button>
+    </div>
+
+    <div class="spacer"></div>
+    <div class="muted"><b>501 Settings</b></div>
+    <div class="row">
+      <input id="s501" type="number" value="501" min="101" max="1001"/>
+      <label class="pill"><input id="dout" type="checkbox" /> Double-out (simplified)</label>
+      <button onclick="save501()">Save 501 Settings</button>
+    </div>
+  </div>
+
+  <div class="card" id="controlsCard">
+    <div class="title">3) Score Entry</div>
+    <div id="controls">Loading…</div>
+  </div>
+
+  <div class="card">
+    <div class="title">Status</div>
+    <pre id="status" class="muted" style="white-space:pre-wrap;"></pre>
+  </div>
+</div>
+
+<script>
+async function post(path, data) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(data || {})
+  });
+  return await r.json();
+}
+
+async function refresh() {
+  const r = await fetch('/state');
+  const s = await r.json();
+  document.getElementById('status').textContent = JSON.stringify(s, null, 2);
+
+  const current = s.players.length ? s.players[s.current] : "—";
+  document.getElementById('turnPill').textContent = "Turn: " + current;
+
+  // Build score controls depending on game
+  const c = document.getElementById('controls');
+
+  if (!s.started) {
+    c.innerHTML = `<div class="muted">Set players, then Start a Game.</div>`;
+    return;
+  }
+
+  if (s.data.winner) {
+    c.innerHTML = `<div class="pill ok">Winner: ${s.data.winner}</div>
+      <div class="spacer"></div>
+      <button onclick="startGame()">Start New Game</button>`;
+    return;
+  }
+
+  if (s.game === "501") {
+    c.innerHTML = `
+      <div class="muted">Enter turn total (0–180). Bust handled automatically.</div>
+      <div class="row">
+        <input id="v501" type="number" min="0" max="180" placeholder="e.g., 60 or 100" />
+        <button class="ok" onclick="add501()">Submit Turn</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="row btnrow">
+        <button onclick="quick501(0)">0</button>
+        <button onclick="quick501(60)">60</button>
+        <button onclick="quick501(100)">100</button>
+        <button onclick="quick501(140)">140</button>
+        <button onclick="quick501(180)">180</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (s.game === "leaderboard") {
+    c.innerHTML = `
+      <div class="muted">Add points for the current player.</div>
+      <div class="row">
+        <input id="vLB" type="number" placeholder="points" />
+        <button class="ok" onclick="addLB()">Add</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="row btnrow">
+        <button onclick="quickLB(1)">+1</button>
+        <button onclick="quickLB(5)">+5</button>
+        <button onclick="quickLB(10)">+10</button>
+        <button onclick="quickLB(25)">+25</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (s.game === "atc") {
+    c.innerHTML = `
+      <div class="muted">Did the current player hit their target?</div>
+      <div class="row btnrow">
+        <button class="ok" onclick="atc(true)">Hit ✅</button>
+        <button class="danger" onclick="atc(false)">Miss ❌</button>
+      </div>
+    `;
+    return;
+  }
+
+  if (s.game === "cricket") {
+    const nums = ["20","19","18","17","16","15","BULL"];
+    const opts = nums.map(n => `<option value="${n}">${n}</option>`).join("");
+    c.innerHTML = `
+      <div class="muted">Select number and hits (1–3).</div>
+      <div class="row">
+        <select id="cNum">${opts}</select>
+        <select id="cHits">
+          <option value="1">1 hit (single)</option>
+          <option value="2">2 hits (double)</option>
+          <option value="3">3 hits (triple)</option>
+        </select>
+        <button class="ok" onclick="cricketHit()">Apply</button>
+      </div>
+      <div class="spacer"></div>
+      <div class="row btnrow">
+        <button onclick="crQ('20',3)">T20</button>
+        <button onclick="crQ('19',3)">T19</button>
+        <button onclick="crQ('18',3)">T18</button>
+        <button onclick="crQ('BULL',2)">Bull x2</button>
+      </div>
+    `;
+    return;
+  }
+
+  c.innerHTML = `<div class="muted">No controls available.</div>`;
+}
+
+async function setPlayers() {
+  const raw = document.getElementById('players').value || "";
+  const players = raw.split(",").map(x=>x.trim()).filter(Boolean);
+  await post('/action', {type:'set_players', players});
+  await refresh();
+}
+
+async function save501() {
+  const start = parseInt(document.getElementById('s501').value || "501");
+  const doubleOut = document.getElementById('dout').checked;
+  await post('/action', {type:'set_501_settings', start, doubleOut});
+  await refresh();
+}
+
+async function startGame() {
+  const game = document.getElementById('gameSel').value;
+  await post('/action', {type:'start_game', game});
+  await refresh();
+}
+
+async function resetAll() {
+  await post('/action', {type:'reset'});
+  await refresh();
+}
+
+async function nextTurn() {
+  await post('/action', {type:'next'});
+  await refresh();
+}
+
+async function add501() {
+  const v = parseInt(document.getElementById('v501').value || "0");
+  await post('/action', {type:'501_add', score:v});
+  await refresh();
+}
+async function quick501(v) {
+  await post('/action', {type:'501_add', score:v});
+  await refresh();
+}
+
+async function addLB() {
+  const v = parseInt(document.getElementById('vLB').value || "0");
+  await post('/action', {type:'lb_add', points:v});
+  await refresh();
+}
+async function quickLB(v) {
+  await post('/action', {type:'lb_add', points:v});
+  await refresh();
+}
+
+async function atc(success) {
+  await post('/action', {type:'atc_hit', success});
+  await refresh();
+}
+
+async function cricketHit() {
+  const number = document.getElementById('cNum').value;
+  const hits = parseInt(document.getElementById('cHits').value);
+  await post('/action', {type:'cricket_hit', number, hits});
+  await refresh();
+}
+async function crQ(number, hits) {
+  await post('/action', {type:'cricket_hit', number, hits});
+  await refresh();
+}
+
+setInterval(refresh, 900);
+refresh();
+</script>
+</body>
+</html>
+"""
+
+@app.get("/")
+def home():
+    return "Darts Party is running. Go to /display (monitor) and /control (phone)."
+
+@app.get("/display")
+def display():
+    return render_template_string(DISPLAY_HTML)
+
+@app.get("/control")
+def control():
+    return render_template_string(CONTROL_HTML)
+
+@app.get("/state")
+def state():
+    # Make state JSON-friendly (keys etc.)
+    return jsonify({
+        "game": STATE["game"],
+        "players": STATE["players"],
+        "current": STATE["current"],
+        "started": STATE["started"],
+        "settings": STATE["settings"],
+        "data": STATE["data"]
+    })
+
+@app.post("/action")
+def action():
+    payload = request.get_json(force=True, silent=True) or {}
+    t = payload.get("type")
+
+    if t == "reset":
+        reset_state()
+        return jsonify({"ok": True})
+
+    if t == "set_players":
+        players = payload.get("players") or []
+        players = [p.strip() for p in players if isinstance(p, str) and p.strip()]
+        if not players:
+            players = ["Player 1", "Player 2"]
+        STATE["players"] = players
+        # If game already started, re-init to keep it simple
+        if STATE["started"] and STATE["game"]:
+            init_game(STATE["game"])
+        return jsonify({"ok": True})
+
+    if t == "set_501_settings":
+        start = safe_int(payload.get("start"), 501)
+        start = max(101, min(1001, start))
+        doubleOut = bool(payload.get("doubleOut"))
+        STATE["settings"]["501_start"] = start
+        STATE["settings"]["501_double_out"] = doubleOut
+        # If currently in 501, restart it to apply settings cleanly
+        if STATE["started"] and STATE["game"] == "501":
+            init_game("501")
+        return jsonify({"ok": True})
+
+    if t == "start_game":
+        game = payload.get("game")
+        if game not in ["501", "cricket", "atc", "leaderboard"]:
+            return jsonify({"ok": False, "error": "Unknown game"}), 400
+        init_game(game)
+        return jsonify({"ok": True})
+
+    if t == "next":
+        advance_turn()
+        return jsonify({"ok": True})
+
+    # Score actions
+    if STATE["game"] == "501" and t == "501_add":
+        handle_501_add(payload.get("score", 0))
+        return jsonify({"ok": True})
+
+    if STATE["game"] == "cricket" and t == "cricket_hit":
+        number = payload.get("number", "20")
+        hits = payload.get("hits", 1)
+        handle_cricket_hit(number, hits)
+        return jsonify({"ok": True})
+
+    if STATE["game"] == "atc" and t == "atc_hit":
+        success = bool(payload.get("success"))
+        handle_atc_hit(success)
+        return jsonify({"ok": True})
+
+    if STATE["game"] == "leaderboard" and t == "lb_add":
+        handle_leaderboard_add(payload.get("points", 0))
+        return jsonify({"ok": True})
+
+    return jsonify({"ok": False, "error": "Action not valid for current game"}), 400
+
+if __name__ == "__main__":
+    # host=0.0.0.0 so phones on Wi-Fi can reach it
+    app.run(host="0.0.0.0", port=5000, debug=False)
+```
+
+### 3) Run it
+
+```bash
+python3 darts_party.py
+```
+
+### 4) Open it
+
+* On the **Pi monitor**: `http://<PI_IP>:5000/display`
+* On your **phone**: `http://<PI_IP>:5000/control`
+
+> Tip: find the Pi IP with `hostname -I`
+
+---
+
+## Put the monitor in fullscreen “kiosk mode” (optional but nice)
+
+On the Pi:
+
+```bash
+chromium-browser --kiosk http://localhost:5000/display
+```
+
+Also disable screen blanking:
+
+```bash
+sudo raspi-config
+# Display Options -> Screen Blanking -> No
+```
+
+---
+
+## Alternative approaches (in case you want even less “app”)
+
+1. **Google Sheets** scoreboard (10 minutes, ultra reliable)
+2. **Cast a scoring app** from your phone to the TV (fastest, but can be glitchy)
+3. If you want ESP32 involvement: build a **button box** later that hits `/action` endpoints (NEXT / UNDO / BUST / +points)
+
+---
+
+## Practical NYE action plan (do this in order)
+
+1. Paste the file, run it, confirm you can hit `/display` and `/control`.
+2. Add player names on `/control`.
+3. Start with **Leaderboard** or **Around the Clock** for fast party flow.
+4. Switch to **501** for the “serious” group later.
+5. If something breaks: hit **Reset Everything** and keep the party moving.
+
+---
+
+## Two quick questions (so I can tailor the next improvement without slowing you down)
+
+1. Do you want **teams** (like 10 teams of 2) as an option for 20 people?
+2. Is your dartboard **steel tip** or **soft tip**?
+
+If you answer those, I’ll adjust the app to support **teams + quick tournament brackets** (still simple, still one file).
