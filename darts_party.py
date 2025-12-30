@@ -1,197 +1,411 @@
 from flask import Flask, request, jsonify, render_template_string
-import time
+import time, random
 
 app = Flask(__name__)
 
-# ---------------------------
-# In-memory game state (simple for party use)
-# ---------------------------
+CRICKET_NUMS = [20, 19, 18, 17, 16, 15, "BULL"]
+
 STATE = {
-    "game": None,            # "501" | "cricket" | "atc" | "leaderboard"
-    "players": [],
+    "mode": "ffa",          # "ffa" | "teams" | "championship"
+    "game": None,           # "501" | "cricket" | "atc" | "leaderboard" | "match"
+    "players": [],          # used for ffa
     "current": 0,
     "started": False,
     "created_at": time.time(),
     "settings": {
         "501_start": 501,
         "501_double_out": False,
+        "match_start": 301,         # used for championship matches
     },
-    # Per-game data
-    "data": {}
+    "teams": {              # used for teams mode
+        "A": [],
+        "B": [],
+        "team_current": 0,  # 0..(max roster-1) to rotate A[i],B[i]
+        "team_turn": "A",   # "A" or "B"
+    },
+    "tournament": {         # used for championship mode
+        "players": [],
+        "round": 1,
+        "matches": [],      # list of {"p1","p2","winner":None}
+        "current_match": 0,
+        "champion": None,
+    },
+    "data": {}              # per-game data
 }
 
-CRICKET_NUMS = [20, 19, 18, 17, 16, 15, "BULL"]
-
+# ---------------------------
+# Helpers
+# ---------------------------
 def reset_state():
+    STATE["mode"] = "ffa"
     STATE["game"] = None
     STATE["players"] = []
     STATE["current"] = 0
     STATE["started"] = False
+    STATE["settings"] = {"501_start": 501, "501_double_out": False, "match_start": 301}
+    STATE["teams"] = {"A": [], "B": [], "team_current": 0, "team_turn": "A"}
+    STATE["tournament"] = {"players": [], "round": 1, "matches": [], "current_match": 0, "champion": None}
     STATE["data"] = {}
-    STATE["settings"] = {"501_start": 501, "501_double_out": False}
     STATE["created_at"] = time.time()
 
-def ensure_players():
-    if not STATE["players"]:
-        STATE["players"] = ["Player 1", "Player 2"]
+def safe_int(val, default=0):
+    try: return int(val)
+    except: return default
 
-def current_player():
+def ensure_players():
+    if STATE["mode"] == "ffa":
+        if not STATE["players"]:
+            STATE["players"] = ["Player 1", "Player 2"]
+    elif STATE["mode"] == "teams":
+        if not STATE["teams"]["A"]:
+            STATE["teams"]["A"] = [f"A{i+1}" for i in range(10)]
+        if not STATE["teams"]["B"]:
+            STATE["teams"]["B"] = [f"B{i+1}" for i in range(10)]
+    elif STATE["mode"] == "championship":
+        if not STATE["tournament"]["players"]:
+            STATE["tournament"]["players"] = [f"P{i+1}" for i in range(8)]
+
+def current_player_label():
     ensure_players()
-    return STATE["players"][STATE["current"] % len(STATE["players"])]
+    if STATE["mode"] == "ffa":
+        return STATE["players"][STATE["current"] % len(STATE["players"])]
+    if STATE["mode"] == "teams":
+        A = STATE["teams"]["A"]; B = STATE["teams"]["B"]
+        idx = STATE["teams"]["team_current"] % max(len(A), len(B))
+        turn = STATE["teams"]["team_turn"]
+        roster = A if turn == "A" else B
+        if idx >= len(roster):  # if uneven rosters, wrap
+            idx = idx % len(roster)
+        return f"Team {turn}: {roster[idx]}"
+    # championship shows current match
+    t = STATE["tournament"]
+    if t["champion"]:
+        return f"Champion: {t['champion']}"
+    if not t["matches"]:
+        return "No matches"
+    m = t["matches"][t["current_match"]]
+    return f"Match: {m['p1']} vs {m['p2']}"
 
 def advance_turn():
-    if STATE["players"]:
-        STATE["current"] = (STATE["current"] + 1) % len(STATE["players"])
+    if STATE["mode"] == "ffa":
+        if STATE["players"]:
+            STATE["current"] = (STATE["current"] + 1) % len(STATE["players"])
+        return
+
+    if STATE["mode"] == "teams":
+        # alternate A/B each turn, advance player index after both have played
+        turn = STATE["teams"]["team_turn"]
+        if turn == "A":
+            STATE["teams"]["team_turn"] = "B"
+        else:
+            STATE["teams"]["team_turn"] = "A"
+            STATE["teams"]["team_current"] = STATE["teams"]["team_current"] + 1
+        return
 
 def init_game(game):
     ensure_players()
     STATE["game"] = game
     STATE["started"] = True
-    STATE["current"] = 0
+    STATE["data"] = {}
 
-    if game == "501":
-        start = int(STATE["settings"].get("501_start", 501))
-        STATE["data"] = {
-            "scores": {p: start for p in STATE["players"]},
-            "last_turn": {p: None for p in STATE["players"]},
-            "winner": None
-        }
+    if STATE["mode"] == "ffa":
+        players = STATE["players"]
+        if game == "501":
+            start = int(STATE["settings"].get("501_start", 501))
+            STATE["data"] = {"scores": {p: start for p in players}, "last": {p: None for p in players}, "winner": None}
+        elif game == "leaderboard":
+            STATE["data"] = {"points": {p: 0 for p in players}}
+        elif game == "atc":
+            STATE["data"] = {"target": {p: 1 for p in players}, "winner": None}
+        elif game == "cricket":
+            STATE["data"] = {
+                "marks": {p: {str(n): 0 for n in CRICKET_NUMS} for p in players},
+                "points": {p: 0 for p in players},
+                "winner": None
+            }
 
-    elif game == "cricket":
-        # marks: 0..3+ (we allow >3 but treat as "extra hits" for points)
-        STATE["data"] = {
-            "marks": {p: {str(n): 0 for n in CRICKET_NUMS} for p in STATE["players"]},
-            "points": {p: 0 for p in STATE["players"]},
-            "winner": None
-        }
+    if STATE["mode"] == "teams":
+        if game == "501":
+            start = int(STATE["settings"].get("501_start", 501))
+            STATE["data"] = {"team_scores": {"A": start, "B": start}, "last": {"A": None, "B": None}, "winner": None}
+        elif game == "leaderboard":
+            STATE["data"] = {"team_points": {"A": 0, "B": 0}}
+        elif game == "atc":
+            STATE["data"] = {"team_target": {"A": 1, "B": 1}, "winner": None}
+        elif game == "cricket":
+            STATE["data"] = {
+                "marks": {"A": {str(n): 0 for n in CRICKET_NUMS}, "B": {str(n): 0 for n in CRICKET_NUMS}},
+                "points": {"A": 0, "B": 0},
+                "winner": None
+            }
+        STATE["teams"]["team_current"] = 0
+        STATE["teams"]["team_turn"] = "A"
 
-    elif game == "atc":
-        # Around the Clock: hit 1..20 then bull to win
-        STATE["data"] = {
-            "target": {p: 1 for p in STATE["players"]},
-            "winner": None
-        }
-
-    elif game == "leaderboard":
-        STATE["data"] = {
-            "points": {p: 0 for p in STATE["players"]},
-            "winner": None
-        }
-
-def safe_int(val, default=0):
-    try:
-        return int(val)
-    except:
-        return default
+    if STATE["mode"] == "championship":
+        # championship uses a special internal "match" 501-style subtract (match_start default 301)
+        start = int(STATE["settings"].get("match_start", 301))
+        STATE["game"] = "match"
+        build_round_if_needed()
+        init_match_scores(start)
 
 # ---------------------------
-# Game logic
+# Championship logic
 # ---------------------------
-def handle_501_add(score):
-    if STATE["data"].get("winner"):
+def build_round_if_needed():
+    t = STATE["tournament"]
+    if t["champion"]:
+        return
+    if not t["matches"]:
+        # create first round from t["players"]
+        players = t["players"][:]
+        random.shuffle(players)
+        # if odd, add a BYE
+        if len(players) % 2 == 1:
+            players.append("BYE")
+        matches = []
+        for i in range(0, len(players), 2):
+            matches.append({"p1": players[i], "p2": players[i+1], "winner": None})
+        t["matches"] = matches
+        t["current_match"] = 0
+        t["round"] = 1
+
+def init_match_scores(start):
+    t = STATE["tournament"]
+    m = t["matches"][t["current_match"]]
+    p1, p2 = m["p1"], m["p2"]
+    # BYE auto-advance
+    if p1 == "BYE" and p2 != "BYE":
+        m["winner"] = p2
+        advance_match()
+        return
+    if p2 == "BYE" and p1 != "BYE":
+        m["winner"] = p1
+        advance_match()
         return
 
-    p = current_player()
+    STATE["data"] = {
+        "match_start": start,
+        "scores": {p1: start, p2: start},
+        "turn": p1,  # alternates within match
+        "winner": None,
+        "last": {p1: None, p2: None}
+    }
+
+def current_match_players():
+    t = STATE["tournament"]
+    if not t["matches"]:
+        return None, None
+    m = t["matches"][t["current_match"]]
+    return m["p1"], m["p2"]
+
+def advance_match():
+    t = STATE["tournament"]
+    # move to next match in round
+    t["current_match"] += 1
+    if t["current_match"] >= len(t["matches"]):
+        # round complete -> build next round from winners
+        winners = [m["winner"] for m in t["matches"] if m["winner"]]
+        if len(winners) == 1:
+            t["champion"] = winners[0]
+            STATE["data"] = {"winner": winners[0]}
+            return
+        t["round"] += 1
+        t["current_match"] = 0
+        # pair winners
+        if len(winners) % 2 == 1:
+            winners.append("BYE")
+        new_matches = []
+        for i in range(0, len(winners), 2):
+            new_matches.append({"p1": winners[i], "p2": winners[i+1], "winner": None})
+        t["matches"] = new_matches
+
+    # init next match
+    start = int(STATE["settings"].get("match_start", 301))
+    init_match_scores(start)
+
+def match_add(score):
+    if STATE["tournament"]["champion"]:
+        return
+    d = STATE["data"]
+    if d.get("winner"):
+        return
+
+    p = d["turn"]
     score = max(0, min(180, int(score)))
-    start_score = STATE["data"]["scores"][p]
+    start_score = d["scores"][p]
     new_score = start_score - score
 
-    # Bust rules (simple):
-    # - If new_score < 0 => bust (score doesn't change)
-    # - If double_out enabled: must finish on exactly 0 with even last dart (not tracked here)
-    #   We'll implement simplified: if double_out enabled, require final throw score to be even and not 1.
-    # - If new_score == 1 => bust (common 501 rule with double-out; we apply always to reduce confusion)
-    bust = False
-
-    if new_score < 0 or new_score == 1:
-        bust = True
-
+    bust = (new_score < 0 or new_score == 1)
     if new_score == 0 and STATE["settings"].get("501_double_out", False):
-        # simplified double-out requirement:
-        # final throw score must be even and <= 40 or bull(50) ideally; we can't track darts,
-        # so we just require the entered score to be even OR 50.
         if not (score == 50 or score % 2 == 0):
             bust = True
 
     if bust:
-        STATE["data"]["last_turn"][p] = f"BUST (tried {score})"
+        d["last"][p] = f"BUST (tried {score})"
     else:
-        STATE["data"]["scores"][p] = new_score
-        STATE["data"]["last_turn"][p] = f"-{score} → {new_score}"
+        d["scores"][p] = new_score
+        d["last"][p] = f"-{score} → {new_score}"
         if new_score == 0:
-            STATE["data"]["winner"] = p
+            d["winner"] = p
+            # set match winner
+            t = STATE["tournament"]
+            t["matches"][t["current_match"]]["winner"] = p
 
-    advance_turn()
+    # alternate turn within match
+    p1, p2 = current_match_players()
+    d["turn"] = p2 if p == p1 else p1
 
-def handle_cricket_hit(number, hits):
-    """
-    number: one of 20..15, BULL
-    hits: 1..3 typically
-    marks beyond 3 become extra "scoring hits" if opponent not closed
-    """
+# ---------------------------
+# Game logic (FFA + Teams)
+# ---------------------------
+def ffa_current_player():
+    return STATE["players"][STATE["current"] % len(STATE["players"])]
+
+def teams_current_team():
+    return STATE["teams"]["team_turn"]  # "A" or "B"
+
+def handle_501_add(score):
     if STATE["data"].get("winner"):
         return
+    score = max(0, min(180, int(score)))
 
-    p = current_player()
+    if STATE["mode"] == "ffa":
+        p = ffa_current_player()
+        start_score = STATE["data"]["scores"][p]
+        new_score = start_score - score
+
+        bust = (new_score < 0 or new_score == 1)
+        if new_score == 0 and STATE["settings"].get("501_double_out", False):
+            if not (score == 50 or score % 2 == 0):
+                bust = True
+
+        if bust:
+            STATE["data"]["last"][p] = f"BUST (tried {score})"
+        else:
+            STATE["data"]["scores"][p] = new_score
+            STATE["data"]["last"][p] = f"-{score} → {new_score}"
+            if new_score == 0:
+                STATE["data"]["winner"] = p
+
+        advance_turn()
+        return
+
+    if STATE["mode"] == "teams":
+        team = teams_current_team()
+        start_score = STATE["data"]["team_scores"][team]
+        new_score = start_score - score
+
+        bust = (new_score < 0 or new_score == 1)
+        if new_score == 0 and STATE["settings"].get("501_double_out", False):
+            if not (score == 50 or score % 2 == 0):
+                bust = True
+
+        if bust:
+            STATE["data"]["last"][team] = f"BUST (tried {score})"
+        else:
+            STATE["data"]["team_scores"][team] = new_score
+            STATE["data"]["last"][team] = f"-{score} → {new_score}"
+            if new_score == 0:
+                STATE["data"]["winner"] = f"Team {team}"
+
+        advance_turn()
+        return
+
+def cricket_hit(number, hits):
+    if STATE["data"].get("winner"):
+        return
     num_key = str(number).upper()
     hits = max(0, min(3, int(hits)))
 
-    if num_key not in STATE["data"]["marks"][p]:
+    if STATE["mode"] == "ffa":
+        p = ffa_current_player()
+        marks = STATE["data"]["marks"]
+        pts = STATE["data"]["points"]
+        if num_key not in marks[p]:
+            return
+
+        for _ in range(hits):
+            if marks[p][num_key] < 3:
+                marks[p][num_key] += 1
+            else:
+                not_closed = any(marks[o][num_key] < 3 for o in STATE["players"] if o != p)
+                if not_closed:
+                    val = 25 if num_key == "BULL" else int(num_key)
+                    pts[p] += val
+
+        all_closed = all(marks[p][str(n)] >= 3 for n in CRICKET_NUMS)
+        if all_closed:
+            max_other = max(pts[o] for o in STATE["players"] if o != p) if len(STATE["players"]) > 1 else 0
+            if pts[p] >= max_other:
+                STATE["data"]["winner"] = p
+
+        advance_turn()
         return
 
-    # Apply hits
-    for _ in range(hits):
-        before = STATE["data"]["marks"][p][num_key]
-        if before < 3:
-            STATE["data"]["marks"][p][num_key] += 1
-        else:
-            # extra hit => score points if at least one opponent not closed
-            # points value: bull=25 per mark; 15-20 use face value
-            not_closed_exists = False
-            for opp in STATE["players"]:
-                if opp == p:
-                    continue
-                if STATE["data"]["marks"][opp][num_key] < 3:
-                    not_closed_exists = True
-                    break
-            if not_closed_exists:
-                val = 25 if num_key == "BULL" else int(num_key)
-                STATE["data"]["points"][p] += val
+    if STATE["mode"] == "teams":
+        team = teams_current_team()
+        marks = STATE["data"]["marks"]
+        pts = STATE["data"]["points"]
+        opp = "B" if team == "A" else "A"
+        if num_key not in marks[team]:
+            return
 
-    # Winner check (common: must have all closed AND >= points of others)
-    all_closed = all(STATE["data"]["marks"][p][str(n)] >= 3 for n in CRICKET_NUMS)
-    if all_closed:
-        max_other = max(STATE["data"]["points"][o] for o in STATE["players"] if o != p) if len(STATE["players"]) > 1 else 0
-        if STATE["data"]["points"][p] >= max_other:
-            STATE["data"]["winner"] = p
+        for _ in range(hits):
+            if marks[team][num_key] < 3:
+                marks[team][num_key] += 1
+            else:
+                if marks[opp][num_key] < 3:
+                    val = 25 if num_key == "BULL" else int(num_key)
+                    pts[team] += val
 
-    advance_turn()
+        all_closed = all(marks[team][str(n)] >= 3 for n in CRICKET_NUMS)
+        if all_closed and pts[team] >= pts[opp]:
+            STATE["data"]["winner"] = f"Team {team}"
 
-def handle_atc_hit(success):
+        advance_turn()
+        return
+
+def atc_hit(success):
     if STATE["data"].get("winner"):
         return
-    p = current_player()
-    if success:
-        t = STATE["data"]["target"][p]
-        # after 20, next target becomes 25 bull
-        if t <= 20:
-            STATE["data"]["target"][p] = t + 1
-        else:
-            # t==21 indicates bull completed
-            STATE["data"]["winner"] = p
-    advance_turn()
 
-def handle_leaderboard_add(points):
-    if STATE["data"].get("winner"):
-        # leaderboard doesn't really "win" unless you want; we just keep adding
-        pass
-    p = current_player()
+    if STATE["mode"] == "ffa":
+        p = ffa_current_player()
+        if success:
+            t = STATE["data"]["target"][p]
+            if t <= 20:
+                STATE["data"]["target"][p] = t + 1
+            else:
+                STATE["data"]["winner"] = p
+        advance_turn()
+        return
+
+    if STATE["mode"] == "teams":
+        team = teams_current_team()
+        if success:
+            t = STATE["data"]["team_target"][team]
+            if t <= 20:
+                STATE["data"]["team_target"][team] = t + 1
+            else:
+                STATE["data"]["winner"] = f"Team {team}"
+        advance_turn()
+        return
+
+def leaderboard_add(points):
     points = safe_int(points, 0)
-    STATE["data"]["points"][p] += points
-    advance_turn()
+    if STATE["mode"] == "ffa":
+        p = ffa_current_player()
+        STATE["data"]["points"][p] += points
+        advance_turn()
+        return
+    if STATE["mode"] == "teams":
+        team = teams_current_team()
+        STATE["data"]["team_points"][team] += points
+        advance_turn()
+        return
 
 # ---------------------------
-# Views
+# UI
 # ---------------------------
 DISPLAY_HTML = """
 <!doctype html>
@@ -203,178 +417,221 @@ DISPLAY_HTML = """
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background: #0b0f14; color: #e8eef7; }
     .top { padding: 18px 22px; display:flex; align-items:center; justify-content:space-between; border-bottom: 1px solid #1d2a3a;}
-    .game { font-size: 22px; font-weight: 700; letter-spacing: 0.4px;}
+    .game { font-size: 22px; font-weight: 800; letter-spacing: 0.4px;}
     .meta { opacity: 0.85; font-size: 14px;}
     .wrap { padding: 18px 22px; }
     .card { background:#0f1722; border:1px solid #1d2a3a; border-radius: 14px; padding: 16px; margin-bottom: 14px; }
     .grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
-    .pname { font-size: 20px; font-weight: 700; margin-bottom: 6px; }
-    .big { font-size: 44px; font-weight: 800; }
+    .pname { font-size: 18px; font-weight: 800; margin-bottom: 6px; }
+    .big { font-size: 44px; font-weight: 900; }
     .small { opacity: 0.85; }
-    .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; border:1px solid #2a3c52; background:#101c2b; font-size: 13px; opacity: 0.95;}
+    .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; border:1px solid #2a3c52; background:#101c2b; font-size: 13px; }
     .active { border-color: #6aa3ff; box-shadow: 0 0 0 2px rgba(106,163,255,0.15) inset; }
     .winner { border-color:#7CFFB0; box-shadow: 0 0 0 2px rgba(124,255,176,0.12) inset;}
     table { width:100%; border-collapse: collapse; }
     td, th { padding: 6px 8px; border-bottom: 1px solid #1d2a3a; text-align:left; }
     .muted { opacity:0.7; }
-    .footer { padding: 10px 22px; opacity:0.7; font-size: 12px; border-top: 1px solid #1d2a3a;}
   </style>
 </head>
 <body>
   <div class="top">
     <div>
-      <div class="game" id="gameTitle">Darts Party</div>
-      <div class="meta" id="metaLine">Loading…</div>
+      <div class="game" id="title">Darts Party</div>
+      <div class="meta" id="meta">Loading…</div>
     </div>
-    <div class="pill" id="turnPill">Turn: —</div>
+    <div class="pill" id="turn">Turn: —</div>
   </div>
-
   <div class="wrap" id="content"></div>
 
-  <div class="footer">
-    Open <span class="muted">/control</span> on your phone to run the game.
-  </div>
-
 <script>
-async function refresh() {
-  const r = await fetch('/state');
-  const s = await r.json();
+async function refresh(){
+  const s = await (await fetch('/state')).json();
+  document.getElementById('title').textContent =
+    (s.mode ? s.mode.toUpperCase() : "FFA") + (s.game ? (" • " + s.game.toUpperCase()) : "");
 
-  document.getElementById('gameTitle').textContent = s.game ? ("Game: " + s.game.toUpperCase()) : "Darts Party";
-  document.getElementById('metaLine').textContent =
-    s.started ? ("Players: " + s.players.join(", ")) : "Go to /control to set players and start a game.";
+  document.getElementById('meta').textContent =
+    s.mode === "teams"
+      ? ("Team A: " + s.teams.A.length + " players • Team B: " + s.teams.B.length + " players")
+      : (s.mode === "championship"
+          ? ("Round " + s.tournament.round + " • Match " + (s.tournament.current_match+1) + "/" + (s.tournament.matches.length||0))
+          : ("Players: " + (s.players.join(", ") || "—")));
 
-  const current = s.players.length ? s.players[s.current] : "—";
-  document.getElementById('turnPill').textContent = "Turn: " + current;
+  document.getElementById('turn').textContent = s.turn_label;
 
   const c = document.getElementById('content');
   c.innerHTML = "";
 
   if (!s.started) {
-    c.innerHTML = `<div class="card"><div class="pname">Not started</div><div class="small">Open /control to choose a game and add players.</div></div>`;
+    c.innerHTML = `<div class="card"><div class="pname">Not started</div><div class="small">Go to /control to set mode + start.</div></div>`;
+    return;
+  }
+
+  // Championship winner
+  if (s.mode === "championship" && s.tournament.champion) {
+    c.innerHTML = `<div class="card winner"><div class="pname">Champion</div><div class="big">${s.tournament.champion}</div></div>`;
     return;
   }
 
   if (s.game === "501") {
-    const winner = s.data.winner;
-    const grid = document.createElement('div');
-    grid.className = "grid";
-    for (const p of s.players) {
-      const card = document.createElement('div');
-      let cls = "card";
-      if (p === current) cls += " active";
-      if (winner && p === winner) cls += " winner";
-      card.className = cls;
+    if (s.mode === "teams") {
+      const w = s.data.winner;
+      c.innerHTML = `
+        ${w ? `<div class="card winner"><div class="pname">Winner</div><div class="big">${w}</div></div>` : ""}
+        <div class="grid">
+          <div class="card ${s.teams.team_turn==="A" ? "active" : ""} ${w==="Team A" ? "winner" : ""}">
+            <div class="pname">Team A</div>
+            <div class="big">${s.data.team_scores.A}</div>
+            <div class="small">${s.data.last.A || ""}</div>
+          </div>
+          <div class="card ${s.teams.team_turn==="B" ? "active" : ""} ${w==="Team B" ? "winner" : ""}">
+            <div class="pname">Team B</div>
+            <div class="big">${s.data.team_scores.B}</div>
+            <div class="small">${s.data.last.B || ""}</div>
+          </div>
+        </div>`;
+      return;
+    }
 
-      const last = s.data.last_turn[p] || "";
-      card.innerHTML = `
+    // FFA
+    const winner = s.data.winner;
+    let html = winner ? `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>` : "";
+    html += `<div class="grid">` + s.players.map(p => `
+      <div class="card ${(s.turn_label.includes(p) ? "active" : "")} ${(winner===p ? "winner":"")}">
         <div class="pname">${p}</div>
         <div class="big">${s.data.scores[p]}</div>
-        <div class="small">${last}</div>
-      `;
-      grid.appendChild(card);
-    }
-    c.appendChild(grid);
-    if (winner) {
-      c.insertAdjacentHTML('afterbegin', `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>`);
-    }
+        <div class="small">${s.data.last[p]||""}</div>
+      </div>`).join("") + `</div>`;
+    c.innerHTML = html;
     return;
   }
 
   if (s.game === "leaderboard") {
-    const points = s.data.points;
-    const rows = Object.entries(points).sort((a,b)=>b[1]-a[1]).map(([p,pt],i)=>(
-      `<tr><td>${i+1}</td><td>${p}</td><td><b>${pt}</b></td></tr>`
-    )).join("");
-    c.innerHTML = `
-      <div class="card">
-        <div class="pname">Leaderboard</div>
-        <table>
-          <thead><tr><th>#</th><th>Player</th><th>Points</th></tr></thead>
-          <tbody>${rows}</tbody>
-        </table>
-      </div>`;
-    return;
+    if (s.mode === "teams") {
+      c.innerHTML = `
+        <div class="grid">
+          <div class="card ${s.teams.team_turn==="A" ? "active" : ""}">
+            <div class="pname">Team A</div>
+            <div class="big">${s.data.team_points.A}</div>
+          </div>
+          <div class="card ${s.teams.team_turn==="B" ? "active" : ""}">
+            <div class="pname">Team B</div>
+            <div class="big">${s.data.team_points.B}</div>
+          </div>
+        </div>`;
+      return;
+    } else {
+      const rows = Object.entries(s.data.points).sort((a,b)=>b[1]-a[1]).map(([p,pt],i)=>(
+        `<tr><td>${i+1}</td><td>${p}</td><td><b>${pt}</b></td></tr>`
+      )).join("");
+      c.innerHTML = `
+        <div class="card">
+          <div class="pname">Leaderboard</div>
+          <table><thead><tr><th>#</th><th>Player</th><th>Points</th></tr></thead><tbody>${rows}</tbody></table>
+        </div>`;
+      return;
+    }
   }
 
   if (s.game === "atc") {
-    const grid = document.createElement('div');
-    grid.className = "grid";
-    const winner = s.data.winner;
-    for (const p of s.players) {
-      const t = s.data.target[p];
-      const targetText = (t <= 20) ? `Hit ${t}` : (t === 21 ? "Done ✅" : "Bull");
-      const card = document.createElement('div');
-      let cls = "card";
-      if (p === current) cls += " active";
-      if (winner && p === winner) cls += " winner";
-      card.className = cls;
-      card.innerHTML = `
-        <div class="pname">${p}</div>
-        <div class="big">${targetText}</div>
-        <div class="small">Progress: ${Math.min(t-1,20)}/20</div>
-      `;
-      grid.appendChild(card);
+    if (s.mode === "teams") {
+      const w = s.data.winner;
+      c.innerHTML = `
+        ${w ? `<div class="card winner"><div class="pname">Winner</div><div class="big">${w}</div></div>` : ""}
+        <div class="grid">
+          <div class="card ${s.teams.team_turn==="A" ? "active" : ""} ${w==="Team A" ? "winner":""}">
+            <div class="pname">Team A</div>
+            <div class="big">Hit ${Math.min(s.data.team_target.A,20)}${s.data.team_target.A>20?" • BULL":""}</div>
+          </div>
+          <div class="card ${s.teams.team_turn==="B" ? "active" : ""} ${w==="Team B" ? "winner":""}">
+            <div class="pname">Team B</div>
+            <div class="big">Hit ${Math.min(s.data.team_target.B,20)}${s.data.team_target.B>20?" • BULL":""}</div>
+          </div>
+        </div>`;
+      return;
     }
-    c.appendChild(grid);
-    if (winner) {
-      c.insertAdjacentHTML('afterbegin', `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>`);
-    }
-    return;
   }
 
   if (s.game === "cricket") {
-    const winner = s.data.winner;
-    const marks = s.data.marks;
-    const pts = s.data.points;
-
-    // summary cards
-    const grid = document.createElement('div');
-    grid.className = "grid";
-    for (const p of s.players) {
-      const card = document.createElement('div');
-      let cls = "card";
-      if (p === current) cls += " active";
-      if (winner && p === winner) cls += " winner";
-      card.className = cls;
-
-      const closedCount = Object.values(marks[p]).filter(v => v >= 3).length;
-      card.innerHTML = `
-        <div class="pname">${p}</div>
-        <div class="big">${pts[p]}</div>
-        <div class="small">Closed: ${closedCount}/7</div>
-      `;
-      grid.appendChild(card);
+    if (s.mode === "teams") {
+      const w = s.data.winner;
+      const nums = ["20","19","18","17","16","15","BULL"];
+      function disp(v){ return v>=3 ? "✔✔✔" : ("•".repeat(v) + "—".repeat(3-v)); }
+      const rowA = nums.map(n=>`<td>${disp(s.data.marks.A[n])}</td>`).join("");
+      const rowB = nums.map(n=>`<td>${disp(s.data.marks.B[n])}</td>`).join("");
+      c.innerHTML = `
+        ${w ? `<div class="card winner"><div class="pname">Winner</div><div class="big">${w}</div></div>` : ""}
+        <div class="grid">
+          <div class="card ${s.teams.team_turn==="A" ? "active" : ""} ${w==="Team A" ? "winner":""}">
+            <div class="pname">Team A Points</div><div class="big">${s.data.points.A}</div>
+          </div>
+          <div class="card ${s.teams.team_turn==="B" ? "active" : ""} ${w==="Team B" ? "winner":""}">
+            <div class="pname">Team B Points</div><div class="big">${s.data.points.B}</div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="pname">Cricket Marks (Teams)</div>
+          <table>
+            <thead><tr><th>Team</th><th>20</th><th>19</th><th>18</th><th>17</th><th>16</th><th>15</th><th>BULL</th><th>Pts</th></tr></thead>
+            <tbody>
+              <tr><td><b>A</b></td>${rowA}<td><b>${s.data.points.A}</b></td></tr>
+              <tr><td><b>B</b></td>${rowB}<td><b>${s.data.points.B}</b></td></tr>
+            </tbody>
+          </table>
+        </div>`;
+      return;
     }
-    c.appendChild(grid);
+  }
 
-    // marks table
-    let header = CRICKET_NUMS.map(n => `<th>${n}</th>`).join("");
-    let body = s.players.map(p => {
-      const cols = CRICKET_NUMS.map(n => {
-        const v = marks[p][String(n)];
-        const disp = v >= 3 ? "✔✔✔" : ("•".repeat(v) + "—".repeat(3-v));
-        return `<td>${disp}</td>`;
-      }).join("");
-      return `<tr><td><b>${p}</b></td>${cols}<td><b>${pts[p]}</b></td></tr>`;
-    }).join("");
+  if (s.game === "match") {
+    // championship match display
+    const d = s.data;
+    const t = s.tournament;
+    const m = t.matches[t.current_match] || null;
+    if (!m) { c.innerHTML = `<div class="card">No match</div>`; return; }
+    const p1 = m.p1, p2 = m.p2;
+    const w = t.champion || (m.winner ? m.winner : null);
 
-    c.insertAdjacentHTML('beforeend', `
+    let html = `
       <div class="card">
-        <div class="pname">Cricket Marks</div>
-        <table>
-          <thead><tr><th>Player</th>${header}<th>Pts</th></tr></thead>
-          <tbody>${body}</tbody>
-        </table>
-        <div class="small muted">Tip: Extra hits after closing score points only if an opponent is not closed.</div>
-      </div>
-    `);
+        <div class="pname">Round ${t.round} • Match ${t.current_match+1}/${t.matches.length}</div>
+        <div class="big">${p1} vs ${p2}</div>
+      </div>`;
 
-    if (winner) {
-      c.insertAdjacentHTML('afterbegin', `<div class="card winner"><div class="pname">Winner</div><div class="big">${winner}</div></div>`);
+    if (m.winner) {
+      html += `<div class="card winner"><div class="pname">Match Winner</div><div class="big">${m.winner}</div></div>`;
     }
+
+    html += `
+      <div class="grid">
+        <div class="card ${d.turn===p1 ? "active":""}">
+          <div class="pname">${p1}</div>
+          <div class="big">${d.scores ? d.scores[p1] : ""}</div>
+          <div class="small">${d.last ? (d.last[p1]||"") : ""}</div>
+        </div>
+        <div class="card ${d.turn===p2 ? "active":""}">
+          <div class="pname">${p2}</div>
+          <div class="big">${d.scores ? d.scores[p2] : ""}</div>
+          <div class="small">${d.last ? (d.last[p2]||"") : ""}</div>
+        </div>
+      </div>`;
+
+    // show bracket list
+    const rows = t.matches.map((mm,i)=>`<tr><td>${i+1}</td><td>${mm.p1}</td><td>${mm.p2}</td><td><b>${mm.winner||""}</b></td></tr>`).join("");
+    html += `
+      <div class="card">
+        <div class="pname">Current Round Bracket</div>
+        <table><thead><tr><th>#</th><th>P1</th><th>P2</th><th>Winner</th></tr></thead><tbody>${rows}</tbody></table>
+      </div>`;
+
+    if (t.champion) {
+      html = `<div class="card winner"><div class="pname">Champion</div><div class="big">${t.champion}</div></div>` + html;
+    }
+
+    c.innerHTML = html;
     return;
   }
+
+  c.innerHTML = `<div class="card"><div class="pname">Started</div><div class="small">Use /control to enter scores.</div></div>`;
 }
 
 setInterval(refresh, 700);
@@ -393,13 +650,13 @@ CONTROL_HTML = """
   <title>Darts Party Control</title>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; background: #0b0f14; color: #e8eef7; }
-    .wrap { padding: 16px; max-width: 820px; margin: 0 auto;}
+    .wrap { padding: 16px; max-width: 880px; margin: 0 auto;}
     .card { background:#0f1722; border:1px solid #1d2a3a; border-radius: 14px; padding: 14px; margin-bottom: 12px; }
     input, select, button { font-size: 16px; padding: 10px; border-radius: 12px; border: 1px solid #2a3c52; background:#0b1220; color:#e8eef7; }
     button { cursor: pointer; }
     .row { display:flex; gap:10px; flex-wrap:wrap; }
     .row > * { flex: 1 1 auto; }
-    .title { font-size: 18px; font-weight: 800; margin-bottom: 10px; }
+    .title { font-size: 18px; font-weight: 900; margin-bottom: 10px; }
     .muted { opacity:0.75; font-size: 13px; }
     .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; border:1px solid #2a3c52; background:#101c2b; font-size: 13px; }
     .danger { border-color: #ff6a6a; }
@@ -407,33 +664,75 @@ CONTROL_HTML = """
     .btnrow button { flex: 1 1 120px; }
     .spacer { height: 6px; }
     a { color:#9ec5ff; text-decoration:none; }
+    textarea { width:100%; min-height:72px; border-radius:12px; border:1px solid #2a3c52; background:#0b1220; color:#e8eef7; padding:10px; font-size:15px;}
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="card">
     <div class="title">Quick Links</div>
-    <div class="muted">Display screen: <a href="/display" target="_blank">/display</a></div>
-    <div class="muted">This page is the scorekeeper control panel.</div>
-  </div>
-
-  <div class="card">
-    <div class="title">1) Players</div>
-    <div class="row">
-      <input id="players" placeholder="Comma-separated: Alex, Sheila, ..." />
-      <button onclick="setPlayers()">Set Players</button>
-    </div>
-    <div class="spacer"></div>
-    <div class="row">
-      <button class="danger" onclick="resetAll()">Reset Everything</button>
-      <button onclick="nextTurn()">Next Turn</button>
-    </div>
-    <div class="spacer"></div>
+    <div class="muted">Display: <a href="/display" target="_blank">/display</a></div>
     <div class="pill" id="turnPill">Turn: —</div>
   </div>
 
   <div class="card">
-    <div class="title">2) Start a Game</div>
+    <div class="title">1) Mode</div>
+    <div class="row">
+      <select id="modeSel">
+        <option value="ffa">Free-for-all</option>
+        <option value="teams">2 Teams</option>
+        <option value="championship">Championships</option>
+      </select>
+      <button onclick="setMode()">Set Mode</button>
+    </div>
+    <div class="spacer"></div>
+    <button class="danger" onclick="resetAll()">Reset Everything</button>
+  </div>
+
+  <div class="card" id="ffaCard">
+    <div class="title">2A) Players (FFA)</div>
+    <div class="muted">Comma-separated names.</div>
+    <div class="row">
+      <input id="players" placeholder="Alex, Sheila, ..." />
+      <button onclick="setPlayers()">Set Players</button>
+    </div>
+  </div>
+
+  <div class="card" id="teamsCard" style="display:none;">
+    <div class="title">2B) Teams (2 Teams)</div>
+    <div class="muted">One name per line.</div>
+    <div class="spacer"></div>
+    <div class="row">
+      <div style="flex:1 1 320px;">
+        <div class="pill">Team A</div>
+        <textarea id="teamA" placeholder="A1\\nA2\\n..."></textarea>
+      </div>
+      <div style="flex:1 1 320px;">
+        <div class="pill">Team B</div>
+        <textarea id="teamB" placeholder="B1\\nB2\\n..."></textarea>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <button onclick="setTeams()">Set Teams</button>
+    <button onclick="nextTurn()">Next Turn</button>
+  </div>
+
+  <div class="card" id="champCard" style="display:none;">
+    <div class="title">2C) Championships</div>
+    <div class="muted">One player per line (20 is fine). App will shuffle + pair matches.</div>
+    <textarea id="tourPlayers" placeholder="Player 1\\nPlayer 2\\n..."></textarea>
+    <div class="spacer"></div>
+    <div class="row">
+      <input id="mstart" type="number" value="301" min="101" max="501"/>
+      <button onclick="saveMatch()">Save Match Start</button>
+      <button class="ok" onclick="startGame()">Start Championships</button>
+    </div>
+    <div class="spacer"></div>
+    <button onclick="nextMatch()">Next Match</button>
+  </div>
+
+  <div class="card">
+    <div class="title">3) Start a Game</div>
     <div class="row">
       <select id="gameSel">
         <option value="501">501</option>
@@ -453,8 +752,8 @@ CONTROL_HTML = """
     </div>
   </div>
 
-  <div class="card" id="controlsCard">
-    <div class="title">3) Score Entry</div>
+  <div class="card">
+    <div class="title">4) Score Entry</div>
     <div id="controls">Loading…</div>
   </div>
 
@@ -466,43 +765,65 @@ CONTROL_HTML = """
 
 <script>
 async function post(path, data) {
-  const r = await fetch(path, {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(data || {})
-  });
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data||{})});
   return await r.json();
 }
 
 async function refresh() {
-  const r = await fetch('/state');
-  const s = await r.json();
+  const s = await (await fetch('/state')).json();
   document.getElementById('status').textContent = JSON.stringify(s, null, 2);
+  document.getElementById('turnPill').textContent = s.turn_label;
 
-  const current = s.players.length ? s.players[s.current] : "—";
-  document.getElementById('turnPill').textContent = "Turn: " + current;
+  document.getElementById('modeSel').value = s.mode;
+  document.getElementById('ffaCard').style.display = (s.mode === "ffa") ? "" : "none";
+  document.getElementById('teamsCard').style.display = (s.mode === "teams") ? "" : "none";
+  document.getElementById('champCard').style.display = (s.mode === "championship") ? "" : "none";
 
-  // Build score controls depending on game
   const c = document.getElementById('controls');
 
   if (!s.started) {
-    c.innerHTML = `<div class="muted">Set players, then Start a Game.</div>`;
+    c.innerHTML = `<div class="muted">Set mode + players, then start a game.</div>`;
     return;
   }
 
-  if (s.data.winner) {
-    c.innerHTML = `<div class="pill ok">Winner: ${s.data.winner}</div>
+  // Championship controls
+  if (s.mode === "championship") {
+    if (s.tournament.champion) {
+      c.innerHTML = `<div class="pill ok">Champion: ${s.tournament.champion}</div>`;
+      return;
+    }
+    if (s.game !== "match") {
+      c.innerHTML = `<div class="muted">Press “Start Championships”.</div>`;
+      return;
+    }
+    c.innerHTML = `
+      <div class="muted">Enter turn total (0–180). Alternates between the two players.</div>
+      <div class="row">
+        <input id="vm" type="number" min="0" max="180" placeholder="e.g. 60" />
+        <button class="ok" onclick="matchAdd()">Submit Turn</button>
+      </div>
       <div class="spacer"></div>
-      <button onclick="startGame()">Start New Game</button>`;
+      <div class="row btnrow">
+        <button onclick="matchQuick(0)">0</button>
+        <button onclick="matchQuick(60)">60</button>
+        <button onclick="matchQuick(100)">100</button>
+        <button onclick="matchQuick(140)">140</button>
+        <button onclick="matchQuick(180)">180</button>
+      </div>
+      <div class="spacer"></div>
+      <button onclick="nextMatch()">Next Match</button>
+    `;
     return;
   }
 
+  // Normal game score entry
   if (s.game === "501") {
     c.innerHTML = `
       <div class="muted">Enter turn total (0–180). Bust handled automatically.</div>
       <div class="row">
         <input id="v501" type="number" min="0" max="180" placeholder="e.g., 60 or 100" />
         <button class="ok" onclick="add501()">Submit Turn</button>
+        <button onclick="nextTurn()">Next Turn</button>
       </div>
       <div class="spacer"></div>
       <div class="row btnrow">
@@ -518,10 +839,11 @@ async function refresh() {
 
   if (s.game === "leaderboard") {
     c.innerHTML = `
-      <div class="muted">Add points for the current player.</div>
+      <div class="muted">Add points for the current turn.</div>
       <div class="row">
         <input id="vLB" type="number" placeholder="points" />
         <button class="ok" onclick="addLB()">Add</button>
+        <button onclick="nextTurn()">Next Turn</button>
       </div>
       <div class="spacer"></div>
       <div class="row btnrow">
@@ -536,10 +858,11 @@ async function refresh() {
 
   if (s.game === "atc") {
     c.innerHTML = `
-      <div class="muted">Did the current player hit their target?</div>
+      <div class="muted">Did they hit their target?</div>
       <div class="row btnrow">
         <button class="ok" onclick="atc(true)">Hit ✅</button>
         <button class="danger" onclick="atc(false)">Miss ❌</button>
+        <button onclick="nextTurn()">Next Turn</button>
       </div>
     `;
     return;
@@ -558,6 +881,7 @@ async function refresh() {
           <option value="3">3 hits (triple)</option>
         </select>
         <button class="ok" onclick="cricketHit()">Apply</button>
+        <button onclick="nextTurn()">Next Turn</button>
       </div>
       <div class="spacer"></div>
       <div class="row btnrow">
@@ -573,10 +897,23 @@ async function refresh() {
   c.innerHTML = `<div class="muted">No controls available.</div>`;
 }
 
+async function setMode() {
+  const mode = document.getElementById('modeSel').value;
+  await post('/action', {type:'set_mode', mode});
+  await refresh();
+}
+
 async function setPlayers() {
   const raw = document.getElementById('players').value || "";
   const players = raw.split(",").map(x=>x.trim()).filter(Boolean);
   await post('/action', {type:'set_players', players});
+  await refresh();
+}
+
+async function setTeams() {
+  const A = (document.getElementById('teamA').value || "").split("\\n").map(x=>x.trim()).filter(Boolean);
+  const B = (document.getElementById('teamB').value || "").split("\\n").map(x=>x.trim()).filter(Boolean);
+  await post('/action', {type:'set_teams', A, B});
   await refresh();
 }
 
@@ -587,46 +924,45 @@ async function save501() {
   await refresh();
 }
 
+async function saveMatch() {
+  const start = parseInt(document.getElementById('mstart').value || "301");
+  await post('/action', {type:'set_match_start', start});
+  await refresh();
+}
+
 async function startGame() {
+  const mode = document.getElementById('modeSel').value;
+  if (mode === "championship") {
+    const players = (document.getElementById('tourPlayers').value || "")
+      .split("\\n").map(x=>x.trim()).filter(Boolean);
+    await post('/action', {type:'set_tournament_players', players});
+    await post('/action', {type:'start_game', game:'match'});
+    await refresh();
+    return;
+  }
   const game = document.getElementById('gameSel').value;
   await post('/action', {type:'start_game', game});
   await refresh();
 }
 
-async function resetAll() {
-  await post('/action', {type:'reset'});
-  await refresh();
-}
-
-async function nextTurn() {
-  await post('/action', {type:'next'});
-  await refresh();
-}
+async function resetAll() { await post('/action', {type:'reset'}); await refresh(); }
+async function nextTurn() { await post('/action', {type:'next'}); await refresh(); }
 
 async function add501() {
   const v = parseInt(document.getElementById('v501').value || "0");
   await post('/action', {type:'501_add', score:v});
   await refresh();
 }
-async function quick501(v) {
-  await post('/action', {type:'501_add', score:v});
-  await refresh();
-}
+async function quick501(v) { await post('/action', {type:'501_add', score:v}); await refresh(); }
 
 async function addLB() {
   const v = parseInt(document.getElementById('vLB').value || "0");
   await post('/action', {type:'lb_add', points:v});
   await refresh();
 }
-async function quickLB(v) {
-  await post('/action', {type:'lb_add', points:v});
-  await refresh();
-}
+async function quickLB(v) { await post('/action', {type:'lb_add', points:v}); await refresh(); }
 
-async function atc(success) {
-  await post('/action', {type:'atc_hit', success});
-  await refresh();
-}
+async function atc(success) { await post('/action', {type:'atc_hit', success}); await refresh(); }
 
 async function cricketHit() {
   const number = document.getElementById('cNum').value;
@@ -634,10 +970,15 @@ async function cricketHit() {
   await post('/action', {type:'cricket_hit', number, hits});
   await refresh();
 }
-async function crQ(number, hits) {
-  await post('/action', {type:'cricket_hit', number, hits});
+async function crQ(number, hits) { await post('/action', {type:'cricket_hit', number, hits}); await refresh(); }
+
+async function matchAdd() {
+  const v = parseInt(document.getElementById('vm').value || "0");
+  await post('/action', {type:'match_add', score:v});
   await refresh();
 }
+async function matchQuick(v) { await post('/action', {type:'match_add', score:v}); await refresh(); }
+async function nextMatch() { await post('/action', {type:'next_match'}); await refresh(); }
 
 setInterval(refresh, 900);
 refresh();
@@ -646,9 +987,12 @@ refresh();
 </html>
 """
 
+# ---------------------------
+# Routes
+# ---------------------------
 @app.get("/")
 def home():
-    return "Darts Party is running. Go to /display (monitor) and /control (phone)."
+    return "Running. Use /display (monitor) and /control (phone)."
 
 @app.get("/display")
 def display():
@@ -660,14 +1004,18 @@ def control():
 
 @app.get("/state")
 def state():
-    # Make state JSON-friendly (keys etc.)
+    ensure_players()
     return jsonify({
+        "mode": STATE["mode"],
         "game": STATE["game"],
         "players": STATE["players"],
         "current": STATE["current"],
         "started": STATE["started"],
         "settings": STATE["settings"],
-        "data": STATE["data"]
+        "teams": STATE["teams"],
+        "tournament": STATE["tournament"],
+        "data": STATE["data"],
+        "turn_label": current_player_label()
     })
 
 @app.post("/action")
@@ -679,15 +1027,53 @@ def action():
         reset_state()
         return jsonify({"ok": True})
 
+    if t == "set_mode":
+        mode = payload.get("mode", "ffa")
+        if mode not in ["ffa", "teams", "championship"]:
+            return jsonify({"ok": False, "error": "Unknown mode"}), 400
+        STATE["mode"] = mode
+        STATE["started"] = False
+        STATE["game"] = None
+        STATE["data"] = {}
+        return jsonify({"ok": True})
+
     if t == "set_players":
         players = payload.get("players") or []
         players = [p.strip() for p in players if isinstance(p, str) and p.strip()]
         if not players:
             players = ["Player 1", "Player 2"]
         STATE["players"] = players
-        # If game already started, re-init to keep it simple
-        if STATE["started"] and STATE["game"]:
+        if STATE["started"] and STATE["mode"] == "ffa" and STATE["game"] in ["501","cricket","atc","leaderboard"]:
             init_game(STATE["game"])
+        return jsonify({"ok": True})
+
+    if t == "set_teams":
+        A = payload.get("A") or []
+        B = payload.get("B") or []
+        A = [x.strip() for x in A if isinstance(x, str) and x.strip()]
+        B = [x.strip() for x in B if isinstance(x, str) and x.strip()]
+        if not A: A = [f"A{i+1}" for i in range(10)]
+        if not B: B = [f"B{i+1}" for i in range(10)]
+        STATE["teams"]["A"] = A
+        STATE["teams"]["B"] = B
+        STATE["teams"]["team_current"] = 0
+        STATE["teams"]["team_turn"] = "A"
+        if STATE["started"] and STATE["mode"] == "teams" and STATE["game"] in ["501","cricket","atc","leaderboard"]:
+            init_game(STATE["game"])
+        return jsonify({"ok": True})
+
+    if t == "set_tournament_players":
+        players = payload.get("players") or []
+        players = [p.strip() for p in players if isinstance(p, str) and p.strip()]
+        if len(players) < 2:
+            players = [f"P{i+1}" for i in range(8)]
+        STATE["tournament"] = {"players": players, "round": 1, "matches": [], "current_match": 0, "champion": None}
+        return jsonify({"ok": True})
+
+    if t == "set_match_start":
+        start = safe_int(payload.get("start"), 301)
+        start = max(101, min(501, start))
+        STATE["settings"]["match_start"] = start
         return jsonify({"ok": True})
 
     if t == "set_501_settings":
@@ -696,44 +1082,56 @@ def action():
         doubleOut = bool(payload.get("doubleOut"))
         STATE["settings"]["501_start"] = start
         STATE["settings"]["501_double_out"] = doubleOut
-        # If currently in 501, restart it to apply settings cleanly
         if STATE["started"] and STATE["game"] == "501":
             init_game("501")
         return jsonify({"ok": True})
 
     if t == "start_game":
         game = payload.get("game")
+        if STATE["mode"] == "championship":
+            init_game("match")
+            return jsonify({"ok": True})
+
         if game not in ["501", "cricket", "atc", "leaderboard"]:
             return jsonify({"ok": False, "error": "Unknown game"}), 400
         init_game(game)
         return jsonify({"ok": True})
 
     if t == "next":
-        advance_turn()
-        return jsonify({"ok": True})
+        if STATE["mode"] in ["ffa", "teams"]:
+            advance_turn()
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "Not applicable"}), 400
 
-    # Score actions
-    if STATE["game"] == "501" and t == "501_add":
+    if t == "next_match":
+        if STATE["mode"] == "championship":
+            advance_match()
+            return jsonify({"ok": True})
+        return jsonify({"ok": False, "error": "Not in championship mode"}), 400
+
+    # Scoring actions
+    if t == "501_add" and STATE["game"] == "501":
         handle_501_add(payload.get("score", 0))
         return jsonify({"ok": True})
 
-    if STATE["game"] == "cricket" and t == "cricket_hit":
-        number = payload.get("number", "20")
-        hits = payload.get("hits", 1)
-        handle_cricket_hit(number, hits)
+    if t == "cricket_hit" and STATE["game"] == "cricket":
+        cricket_hit(payload.get("number", "20"), payload.get("hits", 1))
         return jsonify({"ok": True})
 
-    if STATE["game"] == "atc" and t == "atc_hit":
-        success = bool(payload.get("success"))
-        handle_atc_hit(success)
+    if t == "atc_hit" and STATE["game"] == "atc":
+        atc_hit(bool(payload.get("success")))
         return jsonify({"ok": True})
 
-    if STATE["game"] == "leaderboard" and t == "lb_add":
-        handle_leaderboard_add(payload.get("points", 0))
+    if t == "lb_add" and STATE["game"] == "leaderboard":
+        leaderboard_add(payload.get("points", 0))
         return jsonify({"ok": True})
 
-    return jsonify({"ok": False, "error": "Action not valid for current game"}), 400
+    if t == "match_add" and STATE["mode"] == "championship" and STATE["game"] == "match":
+        match_add(payload.get("score", 0))
+        # if match winner set, you can press "Next Match"
+        return jsonify({"ok": True})
+
+    return jsonify({"ok": False, "error": "Action not valid for current mode/game"}), 400
 
 if __name__ == "__main__":
-    # host=0.0.0.0 so phones on Wi-Fi can reach it
     app.run(host="0.0.0.0", port=5000, debug=False)
