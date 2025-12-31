@@ -1,7 +1,9 @@
+import os
+APP_DB = os.environ.get("DB_PATH", "darts.db")
+
 from flask import Flask, request, redirect, url_for, render_template_string, jsonify
 import sqlite3, os, time, datetime
 
-APP_DB = "darts.db"
 app = Flask(__name__)
 
 # -------------------------
